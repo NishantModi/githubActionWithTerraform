@@ -1,7 +1,7 @@
 # ──────────────────────────────────────────────────────────
 # Terraform CI/CD Pipeline — Azure VNet with OIDC Auth
 # ──────────────────────────────────────────────────────────
-name: "Terraform Azure Networking"
+name: "Terraform Azure Infra Provisioning"
 
 # ── TRIGGERS ──────────────────────────────────────────────
 on:
