@@ -118,6 +118,11 @@ env:
   # instead of looking for a client_secret
   ARM_USE_OIDC: true
 
+  # Terraform reads any TF_VAR_* env var and maps it to the matching variable.
+  # TF_VAR_windows_vm_admin_password → var.windows_vm_admin_password
+  # Store the value in: GitHub repo → Settings → Secrets → Actions → WINDOWS_VM_ADMIN_PASSWORD
+  TF_VAR_windows_vm_admin_password: ${{ secrets.WINDOWS_VM_ADMIN_PASSWORD }}
+
   # GitHub is deprecating Node.js 20 for Actions (June 2026).
   # This forces actions to run on Node.js 24 to avoid warnings.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
