@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────
-# Input Variables
+# Shared
 # ──────────────────────────────────────────────────────────
 
 variable "environment" {
@@ -14,8 +14,24 @@ variable "location" {
   default     = "centralindia"
 }
 
+variable "resource_group_name" {
+  description = "Name of the existing resource group"
+  type        = string
+  default     = "NishantModi-RG"
+}
+
+variable "tags" {
+  description = "Tags applied to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+# ──────────────────────────────────────────────────────────
+# Networking
+# ──────────────────────────────────────────────────────────
+
 variable "vnet_name" {
-  description = "Name of the Virtual Network"
+  description = "Base name of the Virtual Network"
   type        = string
   default     = "vnet-centralindia"
 }
@@ -29,7 +45,7 @@ variable "vnet_address_space" {
 variable "subnets" {
   description = "Map of subnet configurations"
   type = map(object({
-    address_prefixes = list(string)
+    address_prefixes  = list(string)
     service_endpoints = optional(list(string), [])
   }))
   default = {
@@ -48,14 +64,30 @@ variable "subnets" {
   }
 }
 
-variable "resource_group_name" {
-  description = "Name of the resource group"
+# ──────────────────────────────────────────────────────────
+# Windows VM
+# ──────────────────────────────────────────────────────────
+
+variable "windows_vm_name" {
+  description = "Name of the Windows VM"
   type        = string
-  default     = "NishantModi-RG"
+  default     = "vm-win"
 }
 
-variable "tags" {
-  description = "Tags applied to all resources"
-  type        = map(string)
-  default     = {}
+variable "windows_vm_size" {
+  description = "Azure VM size — Standard_B1ms is the cheapest size that reliably runs Windows Server"
+  type        = string
+  default     = "Standard_B1ms"
+}
+
+variable "windows_vm_admin_username" {
+  description = "Local administrator username for the Windows VM"
+  type        = string
+  default     = "azureadmin"
+}
+
+variable "windows_vm_admin_password" {
+  description = "Local administrator password — supply via TF_VAR_windows_vm_admin_password env var, never hardcode"
+  type        = string
+  sensitive   = true
 }
