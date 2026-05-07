@@ -1,0 +1,273 @@
+# ──────────────────────────────────────────────────────────
+# Terraform CI/CD Pipeline — Azure VNet with OIDC Auth
+# ──────────────────────────────────────────────────────────
+name: "Terraform Azure Networking"
+
+# ── TRIGGERS ──────────────────────────────────────────────
+on:
+  # Run plan on PRs targeting main
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+
+  # Run plan + apply on push to main (after PR merge)
+  push:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+
+  # Manual trigger — for on-demand runs
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+# ── PERMISSIONS ───────────────────────────────────────────
+# Minimal permissions — principle of least privilege
+permissions:
+  id-token: write        # Required for OIDC token request
+  contents: read         # Required to checkout code
+  pull-requests: write   # Required to post plan as PR comment
+
+# ── PREVENT DUPLICATE RUNS ───────────────────────────────
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# ── GLOBAL ENV VARS ──────────────────────────────────────
+env:
+  TF_VERSION: "1.7.5"
+  WORKING_DIR: "infra/terraform"
+  # These are read by the azurerm provider automatically
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: true     # Tells azurerm provider to use OIDC
+
+# ── JOBS ──────────────────────────────────────────────────
+jobs:
+
+  # ════════════════════════════════════════════════════════
+  # JOB 1: Terraform Plan
+  # ════════════════════════════════════════════════════════
+  terraform-plan:
+    name: "📋 Terraform Plan"
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    outputs:
+      has-changes: ${{ steps.plan.outputs.exitcode == '2' }}
+
+    steps:
+      # ── Step 1: Checkout repository ────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Install Terraform ──────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true    # Captures stdout/stderr
+
+      # ── Step 3: Authenticate to Azure via OIDC ─────────
+      #    No secrets are exchanged here — GitHub's OIDC
+      #    provider sends a signed JWT to Azure AD, which
+      #    validates the claims (repo, branch) and returns
+      #    a short-lived access token.
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── Step 4: Terraform Init ─────────────────────────
+      #    Downloads the azurerm provider and configures
+      #    the blob storage backend for state.
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      # ── Step 5: Terraform Format Check ─────────────────
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      # ── Step 6: Terraform Validate ─────────────────────
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      # ── Step 7: Terraform Plan ─────────────────────────
+      #    -detailed-exitcode:
+      #       0 = no changes
+      #       1 = error
+      #       2 = changes pending → we'll use this in Job 2
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="envs/dev.tfvars" \
+            -out=tfplan \
+            -detailed-exitcode \
+            -no-color
+        continue-on-error: true
+
+      # ── Step 8: Post Plan Output as PR Comment ─────────
+      #    Reviewers can see exactly what infra will change
+      #    before approving the merge.
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Terraform Plan Results 🏗️
+
+            #### Format: \`${{ steps.fmt.outcome }}\`
+            #### Validate: \`${{ steps.validate.outcome }}\`
+            #### Plan: \`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan Output</summary>
+
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output.substring(0, 65536)
+            });
+
+      # ── Step 9: Fail if plan errored ───────────────────
+      - name: Check Plan Status
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+      # ── Step 10: Upload plan artifact for apply job ────
+      - name: Upload Plan
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 5
+
+  # ════════════════════════════════════════════════════════
+  # JOB 2: Terraform Apply
+  # ════════════════════════════════════════════════════════
+  terraform-apply:
+    name: "🚀 Terraform Apply"
+    needs: terraform-plan
+
+    # Only apply when:
+    #   - Push to main (PR was merged), OR
+    #   - Manual dispatch with 'apply' selected
+    #   AND plan detected changes
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    runs-on: ubuntu-latest
+
+    # Environment protection rules kick in here.
+    # Configure required reviewers for 'production' in GitHub Settings.
+    environment:
+      name: dev
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}
+
+      # ── THE APPLY ──────────────────────────────────────
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      # ── Show what was created ──────────────────────────
+      - name: Show Outputs
+        run: terraform output -json
+
+  # ════════════════════════════════════════════════════════
+  # JOB 3: Terraform Destroy (manual only)
+  # ════════════════════════════════════════════════════════
+  terraform-destroy:
+    name: "💥 Terraform Destroy"
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev        # Will trigger approval if protection rules set
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy \
+            -var-file="envs/dev.tfvars" \
+            -auto-approve
