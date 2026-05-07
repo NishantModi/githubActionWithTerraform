@@ -18,7 +18,7 @@ Developer Workstation (Windows)    GitHub                        Azure
 │                 │    │  ├── tf init     │───►│  Resource Group          │
 │                 │    │  ├── tf plan     │    │  └── Virtual Network     │
 │                 │    │  └── tf apply    │    │      ├── subnet-web      │
-│                 │    │                  │    │      ├── subnet-app       │
+│                 │    │                  │    │      ├── subnet-app      │
 └─────────────────┘    └──────────────────┘    │      └── subnet-db       │
                                                └──────────────────────────┘
 ```
