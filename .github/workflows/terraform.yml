@@ -1,90 +1,253 @@
-# ──────────────────────────────────────────────────────────
-# Terraform CI/CD Pipeline — Azure VNet with OIDC Auth
-# ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TERRAFORM CI/CD PIPELINE — Azure Infrastructure with OIDC Authentication
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# What this workflow does:
+#   1. Automatically detects the target environment (dev/staging/prod)
+#   2. Runs terraform plan and posts the output as a PR comment for review
+#   3. On merge to main (or manual trigger), applies the approved plan
+#   4. Supports manual destroy for teardown
+#
+# Authentication: Uses OIDC (OpenID Connect) — no stored secrets/passwords.
+#   GitHub sends a signed JWT token to Azure AD, which validates it against
+#   federated credentials and returns a short-lived access token (~1 hour).
+#
+# Prerequisites:
+#   - Azure App Registration with federated credentials for each environment
+#   - GitHub Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   - GitHub Environments: dev, staging, prod (with optional approval rules)
+#   - Terraform var files: infra/terraform/envs/{dev,staging,prod}.tfvars
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
 name: "Terraform Azure Infra Provisioning"
 
-# ── TRIGGERS ──────────────────────────────────────────────
+# ── TRIGGERS ─────────────────────────────────────────────────────────────────
+# Define WHEN this workflow runs. Three trigger types:
+#
+#   pull_request → runs plan only (so reviewers can see infra changes)
+#   push         → runs plan + apply (after PR merge, infra gets provisioned)
+#   workflow_dispatch → manual trigger with dropdown menus for env + action
+# ─────────────────────────────────────────────────────────────────────────────
 on:
-  # Run plan on PRs targeting main
+
+  # Trigger on Pull Requests targeting main branch
+  # Purpose: Run terraform plan so reviewers see what will change BEFORE merge
   pull_request:
     branches: [main]
     paths:
-      - 'infra/terraform/**'
+      - 'infra/terraform/**'    # Only trigger when Terraform files change
+                                # Saves runner minutes — app code changes
+                                # won't trigger this workflow
 
-  # Run plan + apply on push to main (after PR merge)
+  # Trigger on push to main or release branches
+  # Purpose: After PR is merged, actually apply the infrastructure changes
   push:
-    branches: [main]
+    branches: [main, 'release/**']   # main → dev, release/* → staging
     paths:
       - 'infra/terraform/**'
 
-  # Manual trigger — for on-demand runs
+  # Manual trigger — appears as "Run workflow" button in GitHub Actions UI
+  # Purpose: On-demand plan/apply/destroy without needing a code push
   workflow_dispatch:
     inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
       action:
         description: 'Terraform action to perform'
         required: true
         type: choice
         options:
-          - plan
-          - apply
-          - destroy
+          - plan       # Preview changes without applying
+          - apply      # Apply the planned changes
+          - destroy    # Tear down all resources
 
-# ── PERMISSIONS ───────────────────────────────────────────
-# Minimal permissions — principle of least privilege
+# ── PERMISSIONS ──────────────────────────────────────────────────────────────
+# Principle of least privilege — only request what's needed.
+# By default GitHub Actions gets read-write on everything, which is too broad.
+# Explicitly setting permissions restricts the GITHUB_TOKEN to only these.
+# ─────────────────────────────────────────────────────────────────────────────
 permissions:
-  id-token: write        # Required for OIDC token request
-  contents: read         # Required to checkout code
-  pull-requests: write   # Required to post plan as PR comment
+  id-token: write        # REQUIRED for OIDC — allows the runner to request
+                         # a JWT token from GitHub's OIDC provider, which is
+                         # then exchanged with Azure AD for an access token.
+                         # Without this, azure/login@v2 fails silently.
 
-# ── PREVENT DUPLICATE RUNS ───────────────────────────────
+  contents: read         # REQUIRED to checkout the repository code.
+                         # "read" is sufficient — we never push commits back.
+
+  pull-requests: write   # REQUIRED to post terraform plan output as a
+                         # comment on the PR. Remove if you don't want
+                         # PR comments.
+
+# ── PREVENT DUPLICATE RUNS ──────────────────────────────────────────────────
+# If you push twice quickly to the same branch, the second push cancels
+# the first run (for PRs). This prevents two terraform applies from
+# running simultaneously and conflicting with each other.
+#
+# The group key includes github.ref so different branches don't cancel
+# each other — a push to main won't cancel a PR workflow on feature/xyz.
+# ─────────────────────────────────────────────────────────────────────────────
 concurrency:
   group: terraform-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # cancel-in-progress is true ONLY for PRs (safe to cancel a preview)
+  # For push-to-main (actual deploys), it queues instead of cancelling
 
-# ── GLOBAL ENV VARS ──────────────────────────────────────
+# ── GLOBAL ENVIRONMENT VARIABLES ─────────────────────────────────────────────
+# Available to ALL jobs and ALL steps in this workflow.
+# ARM_* variables are read automatically by the azurerm Terraform provider.
+# ─────────────────────────────────────────────────────────────────────────────
 env:
   TF_VERSION: "1.7.5"
   WORKING_DIR: "infra/terraform"
+
+  # These three are read by the azurerm provider automatically
+  # (it looks for ARM_CLIENT_ID, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID)
   ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  ARM_USE_OIDC: true
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true    # ← Add this line
 
-# ── JOBS ──────────────────────────────────────────────────
+  # Tells the azurerm provider to use OIDC authentication
+  # instead of looking for a client_secret
+  ARM_USE_OIDC: true
+
+  # GitHub is deprecating Node.js 20 for Actions (June 2026).
+  # This forces actions to run on Node.js 24 to avoid warnings.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ── JOBS ─────────────────────────────────────────────────────────────────────
 jobs:
 
-  # ════════════════════════════════════════════════════════
-  # JOB 1: Terraform Plan
-  # ════════════════════════════════════════════════════════
-  terraform-plan:
-    name: "📋 Terraform Plan"
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 0: DETERMINE ENVIRONMENT
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # WHY THIS EXISTS:
+  #   Instead of hardcoding "dev" everywhere, this job resolves the target
+  #   environment ONCE based on how the workflow was triggered. All downstream
+  #   jobs read this output — so plan, apply, and destroy automatically pick
+  #   the correct .tfvars file and GitHub environment.
+  #
+  # MAPPING LOGIC:
+  #   ┌──────────────────────────┬─────────────┐
+  #   │ Trigger                  │ Environment │
+  #   ├──────────────────────────┼─────────────┤
+  #   │ Manual (dropdown)        │ selection   │
+  #   │ Push to main             │ dev         │
+  #   │ Push to release/*        │ staging     │
+  #   │ Tag v* (e.g., v1.0.0)    │ prod        │
+  #   │ Pull request             │ dev         │
+  #   └──────────────────────────┴─────────────┘
+  #
+  # HOW DOWNSTREAM JOBS READ IT:
+  #   ${{ needs.set-environment.outputs.env-name }}
+  #
+  # ════════════════════════════════════════════════════════════════════════════
+  set-environment:
+    name: "🎯 Set Environment"
     runs-on: ubuntu-latest
+    outputs:
+      # This output is consumed by all downstream jobs via:
+      #   needs.set-environment.outputs.env-name
+      env-name: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Determine environment from trigger
+        id: set-env
+        run: |
+          # Manual trigger → use whatever the user selected in the dropdown
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV_NAME="${{ github.event.inputs.environment }}"
 
+          # Push to release/* branches → staging environment
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            ENV_NAME="staging"
+
+          # Git tag like v1.0.0 → production environment
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ENV_NAME="prod"
+
+          # Everything else (push to main, PRs) → dev environment
+          else
+            ENV_NAME="dev"
+          fi
+
+          # Write to GITHUB_OUTPUT so other jobs can read it
+          echo "environment=$ENV_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Resolved environment: $ENV_NAME"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: TERRAFORM PLAN
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # PURPOSE:
+  #   Preview what Terraform will create/modify/destroy WITHOUT actually
+  #   doing it. This is the "dry run" step.
+  #
+  # RUNS ON:
+  #   Every trigger — PRs, pushes, and manual dispatches all run plan first.
+  #
+  # KEY BEHAVIORS:
+  #   - Picks the correct .tfvars file based on resolved environment
+  #   - Posts plan output as a PR comment (so reviewers see infra changes)
+  #   - Uses -detailed-exitcode to detect if there are actual changes:
+  #       Exit 0 = no changes needed (pipeline stops gracefully)
+  #       Exit 1 = error in the plan (pipeline fails)
+  #       Exit 2 = changes detected (plan file saved for apply job)
+  #   - Saves the plan file as an artifact for the apply job to consume
+  #
+  # ════════════════════════════════════════════════════════════════════════════
+  terraform-plan:
+    name: "📋 Terraform Plan (${{ needs.set-environment.outputs.env-name }})"
+    needs: set-environment      # Waits for Job 0 to resolve the environment
+    runs-on: ubuntu-latest      # Uses GitHub-hosted Linux runner
+
+    # Set the default working directory for all `run:` steps in this job
+    # so we don't have to write `cd infra/terraform` in every step
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
 
+    # Job outputs — other jobs can read these via needs.terraform-plan.outputs.*
     outputs:
       has-changes: ${{ steps.plan.outputs.exitcode == '2' }}
 
     steps:
-      # ── Step 1: Checkout repository ────────────────────
+      # ── Step 1: Clone the repository ───────────────────────────────────────
+      # Downloads your code to the runner. Without this, Terraform has
+      # no .tf files to work with.
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Step 2: Install Terraform ──────────────────────
+      # ── Step 2: Install Terraform CLI ──────────────────────────────────────
+      # Installs the specific Terraform version on the runner.
+      # terraform_wrapper: true → captures stdout/stderr into step outputs
+      # so we can use ${{ steps.plan.outputs.stdout }} later for PR comments.
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: true    # Captures stdout/stderr
+          terraform_wrapper: true
 
-      # ── Step 3: Authenticate to Azure via OIDC ─────────
-      #    No secrets are exchanged here — GitHub's OIDC
-      #    provider sends a signed JWT to Azure AD, which
-      #    validates the claims (repo, branch) and returns
-      #    a short-lived access token.
+      # ── Step 3: Authenticate to Azure via OIDC ─────────────────────────────
+      # This is where the OIDC magic happens:
+      #   1. GitHub runner requests a JWT from GitHub's OIDC provider
+      #   2. JWT contains claims: repo name, branch, environment
+      #   3. azure/login sends this JWT to Azure AD
+      #   4. Azure AD checks the federated credential's subject claim
+      #   5. If it matches → returns a short-lived Azure access token (~1hr)
+      #   6. No client secret is stored or transmitted at any point
+      #
+      # IMPORTANT: The OIDC subject claim changes based on job context:
+      #   - Job WITHOUT environment: → subject = repo:org/repo:ref:refs/heads/main
+      #   - Job WITH environment:    → subject = repo:org/repo:environment:dev
+      #   Each needs its own federated credential in Azure AD.
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -92,51 +255,82 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── Step 4: Terraform Init ─────────────────────────
-      #    Downloads the azurerm provider and configures
-      #    the blob storage backend for state.
+      # ── Step 4: Terraform Init ─────────────────────────────────────────────
+      # Initializes Terraform:
+      #   - Downloads the azurerm provider plugin
+      #   - Connects to the Azure Blob Storage backend to read/write state
+      #   - The backend also uses OIDC (configured via use_oidc=true in providers.tf)
       - name: Terraform Init
         id: init
         run: terraform init
 
-      # ── Step 5: Terraform Format Check ─────────────────
+      # ── Step 5: Terraform Format Check ─────────────────────────────────────
+      # Checks if .tf files follow standard formatting (indentation, spacing).
+      # continue-on-error: true → won't fail the pipeline, just reports status.
+      # The result is shown in the PR comment so the team knows.
       - name: Terraform Format Check
         id: fmt
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      # ── Step 6: Terraform Validate ─────────────────────
+      # ── Step 6: Terraform Validate ─────────────────────────────────────────
+      # Checks Terraform configuration for syntax errors and internal
+      # consistency (e.g., missing required variables, invalid references).
+      # Doesn't talk to Azure — purely local validation.
       - name: Terraform Validate
         id: validate
         run: terraform validate -no-color
 
-      # ── Step 7: Terraform Plan ─────────────────────────
-      #    -detailed-exitcode:
-      #       0 = no changes
-      #       1 = error
-      #       2 = changes pending → we'll use this in Job 2
+      # ── Step 7: Terraform Plan ─────────────────────────────────────────────
+      # The core step — computes what changes Terraform will make.
+      #
+      # -var-file  → picks the correct .tfvars based on resolved environment
+      #              e.g., envs/dev.tfvars, envs/staging.tfvars, envs/prod.tfvars
+      #
+      # -out       → saves the computed plan to a binary file (tfplan)
+      #              This exact plan is what the apply job will execute,
+      #              ensuring "what was reviewed = what gets deployed"
+      #
+      # -detailed-exitcode → changes the exit code behavior:
+      #              0 = success, no changes needed
+      #              1 = error occurred
+      #              2 = success, changes are pending
+      #              We use exit code 2 to decide whether to run apply
+      #
+      # -no-color  → strips ANSI color codes so PR comments render cleanly
+      #
+      # continue-on-error: true → prevents exit code 2 (changes pending)
+      #              from being treated as a failure
       - name: Terraform Plan
         id: plan
         run: |
           terraform plan \
-            -var-file="envs/dev.tfvars" \
+            -var-file="envs/${{ needs.set-environment.outputs.env-name }}.tfvars" \
             -out=tfplan \
             -detailed-exitcode \
             -no-color
         continue-on-error: true
 
-      # ── Step 8: Post Plan Output as PR Comment ─────────
-      #    Reviewers can see exactly what infra will change
-      #    before approving the merge.
+      # ── Step 8: Post Plan Output as PR Comment ─────────────────────────────
+      # Only runs on pull_request events.
+      # Posts the full plan output (what will be created/modified/destroyed)
+      # as a comment on the PR. This way reviewers can see the infra impact
+      # without opening the Actions logs.
+      #
+      # Uses actions/github-script to call the GitHub API directly.
+      # The plan output is passed via the PLAN environment variable
+      # (not inline interpolation, to avoid YAML escaping issues).
       - name: Post Plan to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           PLAN: ${{ steps.plan.outputs.stdout }}
+          TARGET_ENV: ${{ needs.set-environment.outputs.env-name }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const output = `### Terraform Plan Results 🏗️
+            **Environment:** \`${process.env.TARGET_ENV}\`
 
             #### Format: \`${{ steps.fmt.outcome }}\`
             #### Validate: \`${{ steps.validate.outcome }}\`
@@ -159,40 +353,83 @@ jobs:
               body: output.substring(0, 65536)
             });
 
-      # ── Step 9: Fail if plan errored ───────────────────
+      # ── Step 9: Fail pipeline if plan had errors ───────────────────────────
+      # Exit code 1 from terraform plan means something is broken
+      # (bad config, auth failure, etc.). We explicitly fail the pipeline.
+      # Exit code 0 (no changes) and 2 (changes pending) are both OK.
       - name: Check Plan Status
         if: steps.plan.outputs.exitcode == '1'
         run: exit 1
 
-      # ── Step 10: Upload plan artifact for apply job ────
+      # ── Step 10: Upload plan file as artifact ──────────────────────────────
+      # Only runs when exit code is 2 (changes detected).
+      # Saves the tfplan binary file so the apply job can download it.
+      #
+      # WHY NOT just re-run plan in the apply job?
+      #   Between plan and apply, someone might push new changes.
+      #   Re-running plan could compute DIFFERENT changes than what
+      #   was reviewed. By saving the exact plan file, apply executes
+      #   exactly what the reviewer approved.
+      #
+      # Artifact name includes the environment to avoid collisions
+      # if multiple environments are planned simultaneously.
       - name: Upload Plan
         if: steps.plan.outputs.exitcode == '2'
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan
+          name: tfplan-${{ needs.set-environment.outputs.env-name }}
           path: ${{ env.WORKING_DIR }}/tfplan
-          retention-days: 5
+          retention-days: 5       # Auto-deleted after 5 days to save storage
 
-  # ════════════════════════════════════════════════════════
-  # JOB 2: Terraform Apply
-  # ════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2: TERRAFORM APPLY
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # PURPOSE:
+  #   Actually creates/modifies/destroys Azure resources based on the
+  #   approved plan from Job 1.
+  #
+  # RUNS ON:
+  #   - Push to main (after PR merge) — automatic deployment
+  #   - Manual dispatch with action=apply — on-demand deployment
+  #
+  # KEY BEHAVIORS:
+  #   - Downloads the EXACT plan file from Job 1 (no re-planning)
+  #   - Uses GitHub environment for approval gates
+  #   - Re-authenticates via OIDC (each job gets a fresh runner)
+  #
+  # WHY RE-AUTHENTICATE?
+  #   Each GitHub Actions job runs on a completely new virtual machine.
+  #   The OIDC token from Job 1 doesn't carry over — Job 2 must request
+  #   its own token. This is a security feature, not a bug.
+  #
+  # OIDC NOTE:
+  #   Because this job has `environment: dev/staging/prod`, the OIDC
+  #   subject claim becomes "repo:org/repo:environment:dev" (not branch-based).
+  #   You need a SEPARATE federated credential in Azure AD for each environment.
+  #
+  # ════════════════════════════════════════════════════════════════════════════
   terraform-apply:
-    name: "🚀 Terraform Apply"
-    needs: terraform-plan
+    name: "🚀 Terraform Apply (${{ needs.set-environment.outputs.env-name }})"
+    needs: [set-environment, terraform-plan]   # Waits for BOTH jobs to complete
 
-    # Only apply when:
-    #   - Push to main (PR was merged), OR
-    #   - Manual dispatch with 'apply' selected
-    #   AND plan detected changes
+    # Conditional execution — only apply when:
+    #   EITHER: code was pushed to main (PR merged) → automatic deploy
+    #   OR:     manual trigger with 'apply' selected → on-demand deploy
     if: |
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
     runs-on: ubuntu-latest
 
-    # Environment protection rules kick in here.
-    # Configure required reviewers for 'production' in GitHub Settings.
+    # GitHub Environment — this triggers environment protection rules:
+    #   - Required reviewers (if configured): workflow PAUSES until approved
+    #   - Wait timers: optional cooldown before deploy
+    #   - Branch restrictions: only allow deploys from specific branches
+    #   - Environment-specific secrets: prod can have different credentials
+    #
+    # The environment name comes from Job 0 (dynamic, not hardcoded).
     environment:
-      name: dev
+      name: ${{ needs.set-environment.outputs.env-name }}
 
     defaults:
       run:
@@ -207,6 +444,8 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      # Re-authenticate — this job runs on a fresh runner, previous
+      # OIDC token from the plan job is not available here.
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -214,34 +453,70 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Re-initialize — the .terraform directory from Job 1 doesn't
+      # exist on this fresh runner. Init downloads providers and
+      # connects to the remote backend again.
       - name: Terraform Init
         run: terraform init
 
+      # Download the EXACT plan file that was reviewed and approved.
+      # This ensures "what was reviewed = what gets deployed".
+      # Artifact name includes environment to match what was uploaded.
       - name: Download Plan
         uses: actions/download-artifact@v4
         with:
-          name: tfplan
+          name: tfplan-${{ needs.set-environment.outputs.env-name }}
           path: ${{ env.WORKING_DIR }}
 
-      # ── THE APPLY ──────────────────────────────────────
+      # THE ACTUAL DEPLOYMENT
+      # -auto-approve skips the interactive "yes/no" prompt since
+      # we're running in CI (no human at the terminal).
+      # The tfplan file contains the EXACT changes — Terraform won't
+      # re-compute; it applies precisely what's in the plan.
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
 
-      # ── Show what was created ──────────────────────────
+      # Display what was created — shows resource IDs, names, etc.
+      # Useful for debugging and verification in the Actions logs.
       - name: Show Outputs
         run: terraform output -json
 
-  # ════════════════════════════════════════════════════════
-  # JOB 3: Terraform Destroy (manual only)
-  # ════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3: TERRAFORM DESTROY (manual only)
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # PURPOSE:
+  #   Tears down ALL resources managed by this Terraform configuration.
+  #   Only available via manual trigger — never runs automatically.
+  #
+  # SAFETY:
+  #   - Can ONLY be triggered via workflow_dispatch (manual button press)
+  #   - Uses GitHub environment protection rules (required reviewers)
+  #   - Requires explicit selection of "destroy" in the dropdown
+  #   - Does NOT depend on the plan job (runs independently)
+  #
+  # WHY NO PLAN FILE?
+  #   Unlike apply, destroy doesn't use a saved plan file. It reads
+  #   the current .tfvars and state file to compute what to delete.
+  #   This is acceptable because destroy is always a manual, deliberate action.
+  #
+  # ════════════════════════════════════════════════════════════════════════════
   terraform-destroy:
-    name: "💥 Terraform Destroy"
+    name: "💥 Terraform Destroy (${{ needs.set-environment.outputs.env-name }})"
+    needs: set-environment       # Only needs environment, NOT the plan job
+
+    # ONLY runs on manual trigger with action=destroy
+    # This condition prevents accidental destroys from pushes or PRs
     if: |
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.action == 'destroy'
     runs-on: ubuntu-latest
+
+    # Environment protection rules apply here too.
+    # For production, you'd configure required reviewers so someone
+    # must approve the destroy before it executes.
     environment:
-      name: dev        # Will trigger approval if protection rules set
+      name: ${{ needs.set-environment.outputs.env-name }}
 
     defaults:
       run:
@@ -266,8 +541,12 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      # Destroy all resources defined in the Terraform configuration.
+      # -var-file loads the environment-specific values so Terraform
+      # knows which resource group, VNet name, etc. to target.
+      # -auto-approve skips the interactive confirmation prompt.
       - name: Terraform Destroy
         run: |
           terraform destroy \
-            -var-file="envs/dev.tfvars" \
+            -var-file="envs/${{ needs.set-environment.outputs.env-name }}.tfvars" \
             -auto-approve
