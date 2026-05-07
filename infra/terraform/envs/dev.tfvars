@@ -1,7 +1,7 @@
 environment         = "dev"
 location            = "eastus"
 vnet_name           = "vnet-main"
-resource_group_name = "rg-networking-dev"
+resource_group_name = "NishantModi-RG"
 vnet_address_space  = ["10.0.0.0/16"]
 
 subnets = {
