@@ -1,7 +1,0 @@
-{
-  "name": "github-actions-env-dev",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:NishantModi/githubActionWithTerraform:environment:dev",
-  "audiences": ["api://AzureADTokenExchange"],
-  "description": "GitHub Actions OIDC for dev environment"
-}
